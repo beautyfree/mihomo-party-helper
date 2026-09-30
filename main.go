@@ -101,10 +101,11 @@ func init() {
 }
 
 type Server struct {
-	engine   *gin.Engine
-	addr     string
-	srv      *http.Server
-	listener net.Listener
+	engine     *gin.Engine
+	addr       string
+	srv        *http.Server
+	listener   net.Listener
+	killSwitch KillSwitch
 }
 
 type Pac struct {
@@ -362,6 +363,30 @@ func (s *Server) setupRoutes() {
 	// Add logging for all routes
 	log.Printf("Setting up routes for server")
 
+	s.engine.POST("/kill-switch", func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+		var request KillSwitchRules
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if err := s.killSwitch.Enable(request); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+	s.engine.DELETE("/kill-switch", func(c *gin.Context) {
+		if err := s.killSwitch.Disable(); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
+	s.engine.GET("/kill-switch", func(c *gin.Context) {
+		c.JSON(http.StatusOK, s.killSwitch.Status())
+	})
+
 	s.engine.POST("/pac", func(c *gin.Context) {
 		log.Printf("Received PAC proxy request with URL: %s", c.Request.URL)
 		var pac Pac
@@ -585,7 +610,18 @@ func (s *Server) createSocket() error {
 	s.listener = listener
 
 	// Set socket permissions
-	if err := os.Chmod(s.addr, 0666); err != nil {
+	adminGroup, err := user.LookupGroup("admin")
+	if err != nil {
+		return err
+	}
+	adminGID, err := strconv.Atoi(adminGroup.Gid)
+	if err != nil {
+		return err
+	}
+	if err := os.Chown(s.addr, 0, adminGID); err != nil {
+		return err
+	}
+	if err := os.Chmod(s.addr, 0660); err != nil {
 		log.Printf("Failed to set socket permissions: %v", err)
 		return err
 	}
@@ -665,7 +701,21 @@ func (s *Server) recreateListener() error {
 	log.Printf("New listener created successfully")
 
 	// Set socket permissions
-	if err := os.Chmod(s.addr, 0666); err != nil {
+	adminGroup, err := user.LookupGroup("admin")
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	adminGID, err := strconv.Atoi(adminGroup.Gid)
+	if err != nil {
+		listener.Close()
+		return err
+	}
+	if err := os.Chown(s.addr, 0, adminGID); err != nil {
+		listener.Close()
+		return err
+	}
+	if err := os.Chmod(s.addr, 0660); err != nil {
 		log.Printf("Failed to set socket permissions: %v", err)
 		listener.Close()
 		return err
@@ -707,7 +757,10 @@ func (s *Server) recreateListener() error {
 
 func main() {
 	log.Printf("Starting mihomo-party-helper server v%s", Version)
-	server := NewServer("/tmp/mihomo-party-helper.sock")
+	server := NewServer("/var/run/party.mihomo.helper.sock")
+	if err := server.killSwitch.Restore(); err != nil {
+		log.Fatalf("Failed to restore Kill Switch: %v", err)
+	}
 
 	if err := server.Start(); err != nil {
 		log.Fatalf("Failed to start server: %v", err)
