@@ -288,14 +288,22 @@ func (k *KillSwitch) enableLocked(request KillSwitchRules) error {
 	if string(previous) == string(state) && k.statusLocked().Healthy {
 		return nil
 	}
+	config, err := os.ReadFile(k.paths.config)
+	if err != nil {
+		return err
+	}
+	if _, err := addPFAnchor(string(config), k.paths.anchor); err != nil {
+		return err
+	}
+	// Persist intent before touching PF, so a partial activation is retried on restart.
+	if err := writeRootFile(k.paths.state, state, 0600); err != nil {
+		return err
+	}
 	// Install the block first. Every later failure leaves traffic blocked.
 	if err := k.loadRules("block drop out quick all\n"); err != nil {
 		return err
 	}
 	if err := k.ensurePFAnchor(); err != nil {
-		return err
-	}
-	if err := writeRootFile(k.paths.state, state, 0600); err != nil {
 		return err
 	}
 	if err := k.enablePF(); err != nil {
