@@ -21,7 +21,12 @@ const (
 	pfAnchorLine     = `anchor "party.mihomo.killswitch" quick`
 )
 
+func pfLoadLine(anchorPath string) string {
+	return fmt.Sprintf(`load anchor "%s" from "%s"`, pfAnchorName, anchorPath)
+}
+
 var pfTokenPattern = regexp.MustCompile(`(?m)^Token : ([0-9]+)$`)
+var ErrKillSwitchDisabled = errors.New("Kill Switch is not enabled")
 
 // The daemon owns this state. The Electron process can die without clearing it.
 type KillSwitch struct {
@@ -37,6 +42,10 @@ type KillSwitchStatus struct {
 func (k *KillSwitch) Status() KillSwitchStatus {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	return k.statusLocked()
+}
+
+func (k *KillSwitch) statusLocked() KillSwitchStatus {
 	if _, err := os.Stat(killSwitchState); errors.Is(err, os.ErrNotExist) {
 		return KillSwitchStatus{}
 	} else if err != nil {
@@ -59,7 +68,10 @@ func (k *KillSwitch) Status() KillSwitchStatus {
 		return status
 	}
 	status.Healthy = strings.Contains(info, "Status: Enabled") &&
-		anchorIsFirstFilterRule(mainRules) && strings.Contains(rules, "block drop out quick all")
+		anchorIsFirstFilterRule(mainRules) &&
+		strings.Contains(rules, "pass out quick on utun") &&
+		strings.Contains(rules, "user = 0") &&
+		strings.Contains(rules, "block drop out quick all")
 	if !status.Healthy {
 		status.Error = "PF is disabled or Kill Switch rules are missing"
 	}
@@ -100,14 +112,18 @@ func writeRootFile(path string, data []byte, mode os.FileMode) error {
 	return os.Rename(tmp.Name(), path)
 }
 
-func addPFAnchor(config string) (string, error) {
+func addPFAnchor(config, anchorPath string) (string, error) {
 	lines := strings.Split(config, "\n")
 	firstFilter := -1
 	installed := -1
+	loadInstalled := false
 	for index, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == pfAnchorLine {
 			installed = index
+		}
+		if trimmed == pfLoadLine(anchorPath) {
+			loadInstalled = true
 		}
 		if firstFilter < 0 && (strings.HasPrefix(trimmed, "anchor ") || strings.HasPrefix(trimmed, "block ") || strings.HasPrefix(trimmed, "pass ")) {
 			firstFilter = index
@@ -117,7 +133,10 @@ func addPFAnchor(config string) (string, error) {
 		if installed != firstFilter {
 			return "", errors.New("Kill Switch anchor is not the first PF filter rule")
 		}
-		return config, nil
+		if loadInstalled {
+			return config, nil
+		}
+		return strings.TrimRight(config, "\n") + "\n" + pfLoadLine(anchorPath) + "\n", nil
 	}
 	if firstFilter >= 0 {
 		trimmed := strings.TrimSpace(lines[firstFilter])
@@ -127,16 +146,16 @@ func addPFAnchor(config string) (string, error) {
 			return "", fmt.Errorf("another quick PF anchor is installed: %s", trimmed)
 		}
 		lines = append(lines[:firstFilter], append([]string{pfAnchorLine}, lines[firstFilter:]...)...)
-		return strings.Join(lines, "\n"), nil
+		return strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n" + pfLoadLine(anchorPath) + "\n", nil
 	}
-	return strings.TrimRight(config, "\n") + "\n" + pfAnchorLine + "\n", nil
+	return strings.TrimRight(config, "\n") + "\n" + pfAnchorLine + "\n" + pfLoadLine(anchorPath) + "\n", nil
 }
 
 func anchorIsFirstFilterRule(rules string) bool {
 	for _, line := range strings.Split(rules, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "anchor ") || strings.HasPrefix(trimmed, "block ") || strings.HasPrefix(trimmed, "pass ") {
-			return strings.Contains(trimmed, pfAnchorName)
+			return strings.Contains(trimmed, `"`+pfAnchorName+`"`) && strings.Contains(trimmed, "quick")
 		}
 	}
 	return false
@@ -147,7 +166,7 @@ func (k *KillSwitch) ensurePFAnchor() error {
 	if err != nil {
 		return err
 	}
-	updated, err := addPFAnchor(string(config))
+	updated, err := addPFAnchor(string(config), killSwitchAnchor)
 	if err != nil {
 		return err
 	}
@@ -212,6 +231,19 @@ func (k *KillSwitch) enablePF() error {
 func (k *KillSwitch) Enable(request KillSwitchRules) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
+	return k.enableLocked(request)
+}
+
+func (k *KillSwitch) Refresh(request KillSwitchRules) error {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if _, err := os.Stat(killSwitchState); err != nil {
+		return ErrKillSwitchDisabled
+	}
+	return k.enableLocked(request)
+}
+
+func (k *KillSwitch) enableLocked(request KillSwitchRules) error {
 	if os.Geteuid() != 0 {
 		return errors.New("kill switch requires the root helper")
 	}
@@ -219,18 +251,22 @@ func (k *KillSwitch) Enable(request KillSwitchRules) error {
 	if err != nil {
 		return err
 	}
-	if err := k.ensurePFAnchor(); err != nil {
-		return err
-	}
 	state, err := json.Marshal(request)
 	if err != nil {
 		return err
 	}
-	if err := writeRootFile(killSwitchState, state, 0600); err != nil {
-		return err
+	previous, _ := os.ReadFile(killSwitchState)
+	if string(previous) == string(state) && k.statusLocked().Healthy {
+		return nil
 	}
 	// Install the block first. Every later failure leaves traffic blocked.
 	if err := k.loadRules("block drop out quick all\n"); err != nil {
+		return err
+	}
+	if err := k.ensurePFAnchor(); err != nil {
+		return err
+	}
+	if err := writeRootFile(killSwitchState, state, 0600); err != nil {
 		return err
 	}
 	if err := k.enablePF(); err != nil {

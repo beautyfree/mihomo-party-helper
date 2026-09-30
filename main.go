@@ -376,6 +376,23 @@ func (s *Server) setupRoutes() {
 		}
 		c.Status(http.StatusNoContent)
 	})
+	s.engine.PUT("/kill-switch", func(c *gin.Context) {
+		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, 64<<10)
+		var request KillSwitchRules
+		if err := c.ShouldBindJSON(&request); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		if err := s.killSwitch.Refresh(request); err != nil {
+			status := http.StatusInternalServerError
+			if errors.Is(err, ErrKillSwitchDisabled) {
+				status = http.StatusConflict
+			}
+			c.JSON(status, gin.H{"error": err.Error()})
+			return
+		}
+		c.Status(http.StatusNoContent)
+	})
 	s.engine.DELETE("/kill-switch", func(c *gin.Context) {
 		if err := s.killSwitch.Disable(); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

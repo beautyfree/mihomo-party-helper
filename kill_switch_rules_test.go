@@ -45,25 +45,28 @@ func TestRenderKillSwitchRulesRejectsInvalidInput(t *testing.T) {
 
 func TestAddPFAnchorBeforeOtherFilterRules(t *testing.T) {
 	config := "scrub-anchor \"com.apple/*\"\nnat-anchor \"com.apple/*\"\nanchor \"com.apple/*\"\n"
-	updated, err := addPFAnchor(config)
+	updated, err := addPFAnchor(config, "/tmp/test-anchor.conf")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Index(updated, "\n"+pfAnchorLine) > strings.Index(updated, "\n"+`anchor "com.apple/*"`) {
 		t.Fatal("Kill Switch anchor must precede other filter anchors")
 	}
-	again, err := addPFAnchor(updated)
+	again, err := addPFAnchor(updated, "/tmp/test-anchor.conf")
 	if err != nil || again != updated {
 		t.Fatalf("anchor insertion is not idempotent: %v", err)
 	}
-	if _, err := addPFAnchor("anchor \"another-kill-switch\" quick\nanchor \"com.apple/*\"\n"); err == nil {
+	if _, err := addPFAnchor("anchor \"another-kill-switch\" quick\nanchor \"com.apple/*\"\n", "/tmp/test-anchor.conf"); err == nil {
 		t.Fatal("competing quick anchor was accepted")
 	}
-	if _, err := addPFAnchor("pass out quick all\n" + pfAnchorLine + "\n"); err == nil {
+	if _, err := addPFAnchor("pass out quick all\n"+pfAnchorLine+"\n", "/tmp/test-anchor.conf"); err == nil {
 		t.Fatal("a pass rule preceding the Kill Switch anchor was accepted")
 	}
 	if anchorIsFirstFilterRule("pass out quick all\n" + pfAnchorLine) {
 		t.Fatal("an ineffective runtime anchor was reported healthy")
+	}
+	if !anchorIsFirstFilterRule(pfAnchorLine + "\nanchor \"com.apple/*\"\n") {
+		t.Fatal("the first quick Kill Switch anchor was not recognized")
 	}
 }
 
@@ -88,5 +91,17 @@ func TestKillSwitchRulesParseOnMacOS(t *testing.T) {
 	output, err := exec.Command("/sbin/pfctl", "-n", "-a", pfAnchorName, "-f", file).CombinedOutput()
 	if err != nil {
 		t.Fatalf("PF rejected rules: %v\n%s", err, output)
+	}
+	config, err := addPFAnchor("scrub-anchor \"com.apple/*\"\nnat-anchor \"com.apple/*\"\nrdr-anchor \"com.apple/*\"\ndummynet-anchor \"com.apple/*\"\nanchor \"com.apple/*\"\n", file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mainFile := filepath.Join(t.TempDir(), "pf.conf")
+	if err := os.WriteFile(mainFile, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	output, err = exec.Command("/sbin/pfctl", "-n", "-f", mainFile).CombinedOutput()
+	if err != nil {
+		t.Fatalf("PF rejected main anchor registration: %v\n%s", err, output)
 	}
 }
