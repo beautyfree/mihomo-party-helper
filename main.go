@@ -757,7 +757,7 @@ func (s *Server) recreateListener() error {
 
 func main() {
 	log.Printf("Starting mihomo-party-helper server v%s", Version)
-	server := NewServer("/var/run/party.mihomo.helper.sock")
+	server := NewServer("/tmp/mihomo-party-helper.sock")
 	if err := server.killSwitch.Restore(); err != nil {
 		log.Fatalf("Failed to restore Kill Switch: %v", err)
 	}
