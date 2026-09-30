@@ -353,9 +353,10 @@ func NewServer(addr string) *Server {
 	}
 
 	return &Server{
-		engine: engine,
-		addr:   addr,
-		srv:    srv,
+		engine:     engine,
+		addr:       addr,
+		srv:        srv,
+		killSwitch: newKillSwitch(),
 	}
 }
 

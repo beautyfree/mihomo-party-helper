@@ -31,7 +31,36 @@ var ErrKillSwitchDisabled = errors.New("Kill Switch is not enabled")
 
 // The daemon owns this state. The Electron process can die without clearing it.
 type KillSwitch struct {
-	mu sync.Mutex
+	mu          sync.Mutex
+	paths       killSwitchPaths
+	runPF       func(...string) (string, error)
+	requireRoot bool
+}
+
+type killSwitchPaths struct {
+	state  string
+	anchor string
+	config string
+	token  string
+}
+
+func newKillSwitch() KillSwitch {
+	return KillSwitch{
+		paths: killSwitchPaths{
+			state:  killSwitchState,
+			anchor: killSwitchAnchor,
+			config: pfConfigPath,
+			token:  pfTokenPath,
+		},
+		requireRoot: true,
+	}
+}
+
+func (k *KillSwitch) pfctl(args ...string) (string, error) {
+	if k.runPF != nil {
+		return k.runPF(args...)
+	}
+	return pfctl(args...)
 }
 
 type KillSwitchStatus struct {
@@ -47,23 +76,23 @@ func (k *KillSwitch) Status() KillSwitchStatus {
 }
 
 func (k *KillSwitch) statusLocked() KillSwitchStatus {
-	if _, err := os.Stat(killSwitchState); errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(k.paths.state); errors.Is(err, os.ErrNotExist) {
 		return KillSwitchStatus{}
 	} else if err != nil {
 		return KillSwitchStatus{Error: err.Error()}
 	}
 	status := KillSwitchStatus{Enabled: true}
-	info, err := pfctl("-s", "info")
+	info, err := k.pfctl("-s", "info")
 	if err != nil {
 		status.Error = err.Error()
 		return status
 	}
-	rules, err := pfctl("-a", pfAnchorName, "-sr")
+	rules, err := k.pfctl("-a", pfAnchorName, "-sr")
 	if err != nil {
 		status.Error = err.Error()
 		return status
 	}
-	mainRules, err := pfctl("-sr")
+	mainRules, err := k.pfctl("-sr")
 	if err != nil {
 		status.Error = err.Error()
 		return status
@@ -162,55 +191,55 @@ func anchorIsFirstFilterRule(rules string) bool {
 }
 
 func (k *KillSwitch) ensurePFAnchor() error {
-	config, err := os.ReadFile(pfConfigPath)
+	config, err := os.ReadFile(k.paths.config)
 	if err != nil {
 		return err
 	}
-	updated, err := addPFAnchor(string(config), killSwitchAnchor)
+	updated, err := addPFAnchor(string(config), k.paths.anchor)
 	if err != nil {
 		return err
 	}
 	if updated == string(config) {
-		rules, err := pfctl("-sr")
+		rules, err := k.pfctl("-sr")
 		if err != nil {
 			return err
 		}
 		if anchorIsFirstFilterRule(rules) {
 			return nil
 		}
-		_, err = pfctl("-f", pfConfigPath)
+		_, err = k.pfctl("-f", k.paths.config)
 		return err
 	}
-	if err := writeRootFile(pfConfigPath+".party-mihomo.backup", config, 0600); err != nil {
+	if err := writeRootFile(k.paths.config+".party-mihomo.backup", config, 0600); err != nil {
 		return err
 	}
-	if err := writeRootFile(pfConfigPath, []byte(updated), 0644); err != nil {
+	if err := writeRootFile(k.paths.config, []byte(updated), 0644); err != nil {
 		return err
 	}
-	if _, err := pfctl("-n", "-f", pfConfigPath); err != nil {
-		_ = writeRootFile(pfConfigPath, config, 0644)
+	if _, err := k.pfctl("-n", "-f", k.paths.config); err != nil {
+		_ = writeRootFile(k.paths.config, config, 0644)
 		return err
 	}
-	if _, err := pfctl("-f", pfConfigPath); err != nil {
-		_ = writeRootFile(pfConfigPath, config, 0644)
+	if _, err := k.pfctl("-f", k.paths.config); err != nil {
+		_ = writeRootFile(k.paths.config, config, 0644)
 		return err
 	}
 	return nil
 }
 
 func (k *KillSwitch) loadRules(rules string) error {
-	if err := writeRootFile(killSwitchAnchor, []byte(rules), 0600); err != nil {
+	if err := writeRootFile(k.paths.anchor, []byte(rules), 0600); err != nil {
 		return err
 	}
-	if _, err := pfctl("-n", "-a", pfAnchorName, "-f", killSwitchAnchor); err != nil {
+	if _, err := k.pfctl("-n", "-a", pfAnchorName, "-f", k.paths.anchor); err != nil {
 		return err
 	}
-	_, err := pfctl("-a", pfAnchorName, "-f", killSwitchAnchor)
+	_, err := k.pfctl("-a", pfAnchorName, "-f", k.paths.anchor)
 	return err
 }
 
 func (k *KillSwitch) enablePF() error {
-	output, err := pfctl("-E")
+	output, err := k.pfctl("-E")
 	if err != nil {
 		return err
 	}
@@ -218,12 +247,12 @@ func (k *KillSwitch) enablePF() error {
 	if len(match) != 2 {
 		return errors.New("pfctl did not return an enable token")
 	}
-	oldToken, _ := os.ReadFile(pfTokenPath)
-	if err := writeRootFile(pfTokenPath, []byte(match[1]), 0600); err != nil {
+	oldToken, _ := os.ReadFile(k.paths.token)
+	if err := writeRootFile(k.paths.token, []byte(match[1]), 0600); err != nil {
 		return err
 	}
 	if previous := strings.TrimSpace(string(oldToken)); previous != "" && previous != match[1] {
-		_, _ = pfctl("-X", previous)
+		_, _ = k.pfctl("-X", previous)
 	}
 	return nil
 }
@@ -237,14 +266,14 @@ func (k *KillSwitch) Enable(request KillSwitchRules) error {
 func (k *KillSwitch) Refresh(request KillSwitchRules) error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if _, err := os.Stat(killSwitchState); err != nil {
+	if _, err := os.Stat(k.paths.state); err != nil {
 		return ErrKillSwitchDisabled
 	}
 	return k.enableLocked(request)
 }
 
 func (k *KillSwitch) enableLocked(request KillSwitchRules) error {
-	if os.Geteuid() != 0 {
+	if k.requireRoot && os.Geteuid() != 0 {
 		return errors.New("kill switch requires the root helper")
 	}
 	rules, err := renderKillSwitchRules(request)
@@ -255,7 +284,7 @@ func (k *KillSwitch) enableLocked(request KillSwitchRules) error {
 	if err != nil {
 		return err
 	}
-	previous, _ := os.ReadFile(killSwitchState)
+	previous, _ := os.ReadFile(k.paths.state)
 	if string(previous) == string(state) && k.statusLocked().Healthy {
 		return nil
 	}
@@ -266,26 +295,26 @@ func (k *KillSwitch) enableLocked(request KillSwitchRules) error {
 	if err := k.ensurePFAnchor(); err != nil {
 		return err
 	}
-	if err := writeRootFile(killSwitchState, state, 0600); err != nil {
+	if err := writeRootFile(k.paths.state, state, 0600); err != nil {
 		return err
 	}
 	if err := k.enablePF(); err != nil {
 		return err
 	}
 	// Existing PF states must not bypass a newly enabled block.
-	if _, err := pfctl("-k", "0.0.0.0/0", "-k", "0.0.0.0/0"); err != nil {
+	if _, err := k.pfctl("-k", "0.0.0.0/0", "-k", "0.0.0.0/0"); err != nil {
 		return err
 	}
-	if _, err := pfctl("-k", "::/0", "-k", "::/0"); err != nil {
+	if _, err := k.pfctl("-k", "::/0", "-k", "::/0"); err != nil {
 		return err
 	}
 	return k.loadRules(rules)
 }
 
 func (k *KillSwitch) Restore() error {
-	state, err := os.ReadFile(killSwitchState)
+	state, err := os.ReadFile(k.paths.state)
 	if errors.Is(err, os.ErrNotExist) {
-		if _, anchorErr := os.Stat(killSwitchAnchor); anchorErr == nil {
+		if _, anchorErr := os.Stat(k.paths.anchor); anchorErr == nil {
 			return k.Disable()
 		}
 		return nil
@@ -303,22 +332,22 @@ func (k *KillSwitch) Restore() error {
 func (k *KillSwitch) Disable() error {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	if os.Geteuid() != 0 {
+	if k.requireRoot && os.Geteuid() != 0 {
 		return errors.New("kill switch requires the root helper")
 	}
-	if err := os.Remove(killSwitchState); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(k.paths.state); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	if err := k.loadRules(""); err != nil {
 		return err
 	}
-	token, _ := os.ReadFile(pfTokenPath)
+	token, _ := os.ReadFile(k.paths.token)
 	if value := strings.TrimSpace(string(token)); value != "" {
-		if _, err := pfctl("-X", value); err != nil {
+		if _, err := k.pfctl("-X", value); err != nil {
 			return err
 		}
 	}
-	if err := os.Remove(pfTokenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(k.paths.token); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
