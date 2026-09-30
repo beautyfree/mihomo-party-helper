@@ -16,6 +16,7 @@ const (
 	killSwitchDir    = "/var/db/party.mihomo"
 	killSwitchState  = killSwitchDir + "/kill-switch.json"
 	killSwitchAnchor = "/etc/pf.anchors/party.mihomo.killswitch"
+	pfTokenPath      = "/var/run/party.mihomo.pf-token"
 	pfConfigPath     = "/etc/pf.conf"
 	pfAnchorName     = "party.mihomo.killswitch"
 	pfAnchorLine     = `anchor "party.mihomo.killswitch" quick`
@@ -125,6 +126,11 @@ func addPFAnchor(config, anchorPath string) (string, error) {
 		if trimmed == pfLoadLine(anchorPath) {
 			loadInstalled = true
 		}
+		if strings.HasPrefix(trimmed, "anchor ") || strings.HasPrefix(trimmed, "block ") || strings.HasPrefix(trimmed, "pass ") {
+			if trimmed != pfAnchorLine && trimmed != `anchor "com.apple/*"` {
+				return "", fmt.Errorf("Kill Switch cannot safely share PF with this filter rule: %s", trimmed)
+			}
+		}
 		if firstFilter < 0 && (strings.HasPrefix(trimmed, "anchor ") || strings.HasPrefix(trimmed, "block ") || strings.HasPrefix(trimmed, "pass ")) {
 			firstFilter = index
 		}
@@ -139,12 +145,6 @@ func addPFAnchor(config, anchorPath string) (string, error) {
 		return strings.TrimRight(config, "\n") + "\n" + pfLoadLine(anchorPath) + "\n", nil
 	}
 	if firstFilter >= 0 {
-		trimmed := strings.TrimSpace(lines[firstFilter])
-		// Another quick anchor may be a separate kill switch. Installing ours
-		// ahead of it could silently disable that product's protection.
-		if strings.HasPrefix(trimmed, "anchor ") && strings.Contains(trimmed, " quick") {
-			return "", fmt.Errorf("another quick PF anchor is installed: %s", trimmed)
-		}
 		lines = append(lines[:firstFilter], append([]string{pfAnchorLine}, lines[firstFilter:]...)...)
 		return strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n" + pfLoadLine(anchorPath) + "\n", nil
 	}
@@ -218,8 +218,8 @@ func (k *KillSwitch) enablePF() error {
 	if len(match) != 2 {
 		return errors.New("pfctl did not return an enable token")
 	}
-	oldToken, _ := os.ReadFile(killSwitchDir + "/pf-token")
-	if err := writeRootFile(killSwitchDir+"/pf-token", []byte(match[1]), 0600); err != nil {
+	oldToken, _ := os.ReadFile(pfTokenPath)
+	if err := writeRootFile(pfTokenPath, []byte(match[1]), 0600); err != nil {
 		return err
 	}
 	if previous := strings.TrimSpace(string(oldToken)); previous != "" && previous != match[1] {
@@ -312,13 +312,13 @@ func (k *KillSwitch) Disable() error {
 	if err := k.loadRules(""); err != nil {
 		return err
 	}
-	token, _ := os.ReadFile(killSwitchDir + "/pf-token")
+	token, _ := os.ReadFile(pfTokenPath)
 	if value := strings.TrimSpace(string(token)); value != "" {
 		if _, err := pfctl("-X", value); err != nil {
 			return err
 		}
 	}
-	if err := os.Remove(killSwitchDir + "/pf-token"); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(pfTokenPath); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
 	return nil
